@@ -68,7 +68,12 @@ def clear_cache():
 # ─────────────────────────────────────────────────────────────────────────────
 @app.route("/trends", methods=["POST"])
 def get_trends():
-    body      = request.get_json(force=True)
+    import json as _json
+    raw_body = request.get_data(as_text=True)
+    try:
+        body = _json.loads(raw_body)
+    except Exception:
+        body = {}
     games     = body.get("games") or body.get("game_list", [])
     timeframe = body.get("timeframe", "today 3-m")
     force     = body.get("force_refresh", False)   # set true to bypass cache
