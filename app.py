@@ -176,7 +176,7 @@ def get_trends():
 
         # ── Delay between countries (skip after final country) ────────────────
         if country_idx < total_countries - 1:
-            time.sleep(random.uniform(4, 6))
+            time.sleep(random.uniform(6, 9))
 
     payload = {
         "status":     "ok",
