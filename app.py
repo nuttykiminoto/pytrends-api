@@ -58,9 +58,10 @@ def clear_cache():
 def get_trends():
     import json as _json
     raw_body = request.get_data(as_text=True)
-    raw_body = raw_body.lstrip('=')
-    raw_body = raw_body.replace('\\"', '"')
-    print(f"[DEBUG] raw_body preview: {raw_body[:200]!r}")
+idx = raw_body.find('{')
+if idx > 0:
+    raw_body = raw_body[idx:]
+print(f"[DEBUG] raw_body preview: {raw_body[:200]!r}")
 
     body = None
     try:
