@@ -72,6 +72,8 @@ def get_trends():
     raw_body = request.get_data(as_text=True)
     try:
         body = _json.loads(raw_body)
+        if isinstance(body, str):
+            body = _json.loads(body)  # fix double-encoded JSON from n8n
     except Exception:
         body = {}
     games     = body.get("games") or body.get("game_list", [])
