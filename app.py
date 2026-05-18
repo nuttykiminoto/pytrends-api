@@ -69,9 +69,10 @@ def clear_cache():
 @app.route("/trends", methods=["POST"])
 def get_trends():
     import json as _json
-   raw_body = request.get_data(as_text=True)
-raw_body = raw_body.lstrip('=')
-print(f"[DEBUG] raw_body preview: {raw_body[:200]!r}")
+    raw_body = request.get_data(as_text=True)
+    raw_body = raw_body.lstrip('=')
+    print(f"[DEBUG] raw_body preview: {raw_body[:200]!r}")
+
     body = None
     try:
         body = request.get_json(force=True, silent=True)
@@ -95,7 +96,7 @@ print(f"[DEBUG] raw_body preview: {raw_body[:200]!r}")
 
     games     = body.get("games") or body.get("game_list", [])
     timeframe = body.get("timeframe", "today 3-m")
-    force     = body.get("force_refresh", False)   # set true to bypass cache
+    force     = body.get("force_refresh", False)
 
     if not games:
         return jsonify({"status": "error", "message": "games array required"}), 400
@@ -108,7 +109,6 @@ print(f"[DEBUG] raw_body preview: {raw_body[:200]!r}")
             return jsonify({**cached, "from_cache": True})
 
     # ── Fresh fetch ───────────────────────────────────────────────────────────
-    # timeout=(connect, read): read timeout generous for slow Trends responses
     pytrends = TrendReq(
         hl="en-US", tz=420,
         timeout=(10, 25),
@@ -125,7 +125,7 @@ print(f"[DEBUG] raw_body preview: {raw_body[:200]!r}")
 
         for chunk_idx, chunk in enumerate(chunks):
 
-            for attempt in range(2):   # max 2 retries (faster failure)
+            for attempt in range(2):
                 try:
                     pytrends.build_payload(
                         chunk, cat=0, timeframe=timeframe, geo=geo, gprop=""
@@ -148,7 +148,7 @@ print(f"[DEBUG] raw_body preview: {raw_body[:200]!r}")
                     else:
                         for g in chunk:
                             results[label][g] = {"dates": [], "values": [], "avg": 0, "peak": 0}
-                    break   # success — exit retry loop
+                    break
 
                 except Exception as e:
                     msg = str(e)
@@ -156,23 +156,19 @@ print(f"[DEBUG] raw_body preview: {raw_body[:200]!r}")
                                      "too many" in msg.lower() or
                                      "response" in msg.lower())
                     if attempt == 0:
-                        # Short wait then retry
                         wait = random.uniform(20, 30) if is_rate_limit else random.uniform(8, 12)
                         print(f"[{geo}] chunk={chunk_idx} retry: {msg[:80]} — wait {wait:.0f}s")
                         time.sleep(wait)
                     else:
-                        # Give up on this chunk — record empty/error
                         for g in chunk:
                             results[label][g] = {
                                 "dates": [], "values": [], "avg": 0, "peak": 0,
                                 "error": msg[:120]
                             }
 
-            # ── Delay between chunks (skip after final chunk) ─────────────────
             if chunk_idx < total_chunks - 1:
                 time.sleep(random.uniform(5, 8))
 
-        # ── Delay between countries (skip after final country) ────────────────
         if country_idx < total_countries - 1:
             time.sleep(random.uniform(8, 12))
 
