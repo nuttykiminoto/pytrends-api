@@ -69,9 +69,9 @@ def clear_cache():
 @app.route("/trends", methods=["POST"])
 def get_trends():
     import json as _json
-    raw_body = request.get_data(as_text=True)
-    print(f"[DEBUG] raw_body preview: {raw_body[:200]!r}")
-
+   raw_body = request.get_data(as_text=True)
+raw_body = raw_body.lstrip('=')
+print(f"[DEBUG] raw_body preview: {raw_body[:200]!r}")
     body = None
     try:
         body = request.get_json(force=True, silent=True)
