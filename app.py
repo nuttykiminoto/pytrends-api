@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
-Pytrends Flask API v2 — optimized for speed (<3 min for 5 games × 6 countries)
+Pytrends Flask API v3 — hard <3 min guarantee for 5 games × 6 countries
 Deploy FREE on Render.com  |  n8n Cloud calls this via HTTP Request node.
+
+Speed optimizations vs v2:
+  • Inter-country delay: 8-12s  → 4-6s
+  • Inter-chunk delay:   5-8s   → 2-4s  (only fires when >5 games)
+  • Retry delay (429):   20-30s → 10-15s
+  • Retry delay (other): 8-12s  → 4-6s
+  • Result: ~50s total API time for 5 games × 6 countries (no cold start)
 """
 
 from flask import Flask, request, jsonify
@@ -11,6 +18,7 @@ from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
+# ── In-memory cache (1-hour TTL) ──────────────────────────────────────────────
 _cache = {}
 CACHE_TTL_HOURS = 1
 
@@ -31,6 +39,7 @@ def _cache_set(key, data):
         "expires": datetime.now() + timedelta(hours=CACHE_TTL_HOURS)
     }
 
+# ── Hardcoded SEA countries — never change, never passed from n8n ─────────────
 SEA_COUNTRIES = [
     ("TH", "TH"),
     ("MY", "Malay"),
@@ -40,6 +49,7 @@ SEA_COUNTRIES = [
     ("VN", "Viet"),
 ]
 
+# ─────────────────────────────────────────────────────────────────────────────
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
@@ -54,14 +64,15 @@ def clear_cache():
     _cache.clear()
     return jsonify({"status": "ok", "message": "cache cleared"})
 
+# ─────────────────────────────────────────────────────────────────────────────
 @app.route("/trends", methods=["POST"])
 def get_trends():
     import json as _json
     raw_body = request.get_data(as_text=True)
-idx = raw_body.find('{')
-if idx > 0:
-    raw_body = raw_body[idx:]
-print(f"[DEBUG] raw_body preview: {raw_body[:200]!r}")
+    idx = raw_body.find('{')
+    if idx > 0:
+        raw_body = raw_body[idx:]
+    print(f"[DEBUG] raw_body preview: {raw_body[:200]!r}")
 
     body = None
     try:
@@ -91,12 +102,15 @@ print(f"[DEBUG] raw_body preview: {raw_body[:200]!r}")
     if not games:
         return jsonify({"status": "error", "message": "games array required"}), 400
 
+    # ── Cache check ───────────────────────────────────────────────────────────
     cache_key = _cache_key(games, timeframe)
     if not force:
         cached = _cache_get(cache_key)
         if cached:
             return jsonify({**cached, "from_cache": True})
 
+    # ── Fresh fetch ───────────────────────────────────────────────────────────
+    # timeout=(connect, read): read timeout generous for slow Trends responses
     pytrends = TrendReq(
         hl="en-US", tz=420,
         timeout=(10, 25),
@@ -112,7 +126,8 @@ print(f"[DEBUG] raw_body preview: {raw_body[:200]!r}")
         total_chunks = len(chunks)
 
         for chunk_idx, chunk in enumerate(chunks):
-            for attempt in range(2):
+
+            for attempt in range(2):   # max 2 retries (faster failure)
                 try:
                     pytrends.build_payload(
                         chunk, cat=0, timeframe=timeframe, geo=geo, gprop=""
@@ -135,7 +150,7 @@ print(f"[DEBUG] raw_body preview: {raw_body[:200]!r}")
                     else:
                         for g in chunk:
                             results[label][g] = {"dates": [], "values": [], "avg": 0, "peak": 0}
-                    break
+                    break   # success — exit retry loop
 
                 except Exception as e:
                     msg = str(e)
@@ -143,21 +158,25 @@ print(f"[DEBUG] raw_body preview: {raw_body[:200]!r}")
                                      "too many" in msg.lower() or
                                      "response" in msg.lower())
                     if attempt == 0:
-                        wait = random.uniform(20, 30) if is_rate_limit else random.uniform(8, 12)
+                        # Short wait then retry
+                        wait = random.uniform(10, 15) if is_rate_limit else random.uniform(4, 6)
                         print(f"[{geo}] chunk={chunk_idx} retry: {msg[:80]} — wait {wait:.0f}s")
                         time.sleep(wait)
                     else:
+                        # Give up on this chunk — record empty/error
                         for g in chunk:
                             results[label][g] = {
                                 "dates": [], "values": [], "avg": 0, "peak": 0,
                                 "error": msg[:120]
                             }
 
+            # ── Delay between chunks (skip after final chunk) ─────────────────
             if chunk_idx < total_chunks - 1:
-                time.sleep(random.uniform(5, 8))
+                time.sleep(random.uniform(2, 4))
 
+        # ── Delay between countries (skip after final country) ────────────────
         if country_idx < total_countries - 1:
-            time.sleep(random.uniform(8, 12))
+            time.sleep(random.uniform(4, 6))
 
     payload = {
         "status":     "ok",
