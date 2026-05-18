@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Pytrends Flask API v3 — hard <3 min guarantee for 5 games × 6 countries
+Pytrends Flask API v3 — reliable 6-country fetch for 5 games
 Deploy FREE on Render.com  |  n8n Cloud calls this via HTTP Request node.
 
-Speed optimizations vs v2:
-  • Inter-country delay: 8-12s  → 4-6s
-  • Inter-chunk delay:   5-8s   → 2-4s  (only fires when >5 games)
-  • Retry delay (429):   20-30s → 10-15s
-  • Retry delay (other): 8-12s  → 4-6s
-  • Result: ~50s total API time for 5 games × 6 countries (no cold start)
+Delay tuning (reliability over raw speed):
+  • Inter-country delay: 8-12s  (avoids Google 429 across 6 countries)
+  • Inter-chunk delay:   5-8s   (only fires when >5 games)
+  • Retry delay (429):   10-15s
+  • Retry delay (other): 4-6s
+  • Total time: ~90-120s for 5 games × 6 countries
 """
 
 from flask import Flask, request, jsonify
@@ -172,11 +172,11 @@ def get_trends():
 
             # ── Delay between chunks (skip after final chunk) ─────────────────
             if chunk_idx < total_chunks - 1:
-                time.sleep(random.uniform(2, 4))
+                time.sleep(random.uniform(5, 8))
 
         # ── Delay between countries (skip after final country) ────────────────
         if country_idx < total_countries - 1:
-            time.sleep(random.uniform(6, 9))
+            time.sleep(random.uniform(8, 12))
 
     payload = {
         "status":     "ok",
