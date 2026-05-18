@@ -70,12 +70,29 @@ def clear_cache():
 def get_trends():
     import json as _json
     raw_body = request.get_data(as_text=True)
+    print(f"[DEBUG] raw_body preview: {raw_body[:200]!r}")
+
+    body = None
     try:
-        body = _json.loads(raw_body)
+        body = request.get_json(force=True, silent=True)
         if isinstance(body, str):
-            body = _json.loads(body)  # fix double-encoded JSON from n8n
+            body = _json.loads(body)
     except Exception:
+        pass
+
+    if not isinstance(body, dict):
+        try:
+            body = _json.loads(raw_body)
+            if isinstance(body, str):
+                body = _json.loads(body)
+        except Exception:
+            body = {}
+
+    if not isinstance(body, dict):
         body = {}
+
+    print(f"[DEBUG] body keys: {list(body.keys())}, games: {body.get('games')}")
+
     games     = body.get("games") or body.get("game_list", [])
     timeframe = body.get("timeframe", "today 3-m")
     force     = body.get("force_refresh", False)   # set true to bypass cache
