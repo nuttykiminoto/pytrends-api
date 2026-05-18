@@ -2,14 +2,6 @@
 """
 Pytrends Flask API v2 — optimized for speed (<3 min for 5 games × 6 countries)
 Deploy FREE on Render.com  |  n8n Cloud calls this via HTTP Request node.
-
-Speed optimizations vs v1:
-  • In-memory cache (1-hour TTL) — repeated runs return instantly
-  • Inter-country delay: 20-35s → 8-12s
-  • Inter-chunk delay:   10-18s → 5-8s  (only fires when >5 games)
-  • Retry delay:         40-80s × n → 20-30s (429) / 8-12s (other)
-  • Retry only 2 attempts instead of 3
-  • Skips final country/chunk delay (no wasted sleep after last item)
 """
 
 from flask import Flask, request, jsonify
@@ -19,7 +11,6 @@ from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
-# ── In-memory cache (1-hour TTL) ──────────────────────────────────────────────
 _cache = {}
 CACHE_TTL_HOURS = 1
 
@@ -40,7 +31,6 @@ def _cache_set(key, data):
         "expires": datetime.now() + timedelta(hours=CACHE_TTL_HOURS)
     }
 
-# ── Hardcoded SEA countries — never change, never passed from n8n ─────────────
 SEA_COUNTRIES = [
     ("TH", "TH"),
     ("MY", "Malay"),
@@ -50,7 +40,6 @@ SEA_COUNTRIES = [
     ("VN", "Viet"),
 ]
 
-# ─────────────────────────────────────────────────────────────────────────────
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
@@ -65,11 +54,10 @@ def clear_cache():
     _cache.clear()
     return jsonify({"status": "ok", "message": "cache cleared"})
 
-# ─────────────────────────────────────────────────────────────────────────────
 @app.route("/trends", methods=["POST"])
 def get_trends():
     import json as _json
-raw_body = request.get_data(as_text=True)
+    raw_body = request.get_data(as_text=True)
     raw_body = raw_body.lstrip('=')
     raw_body = raw_body.replace('\\"', '"')
     print(f"[DEBUG] raw_body preview: {raw_body[:200]!r}")
@@ -102,14 +90,12 @@ raw_body = request.get_data(as_text=True)
     if not games:
         return jsonify({"status": "error", "message": "games array required"}), 400
 
-    # ── Cache check ───────────────────────────────────────────────────────────
     cache_key = _cache_key(games, timeframe)
     if not force:
         cached = _cache_get(cache_key)
         if cached:
             return jsonify({**cached, "from_cache": True})
 
-    # ── Fresh fetch ───────────────────────────────────────────────────────────
     pytrends = TrendReq(
         hl="en-US", tz=420,
         timeout=(10, 25),
@@ -125,7 +111,6 @@ raw_body = request.get_data(as_text=True)
         total_chunks = len(chunks)
 
         for chunk_idx, chunk in enumerate(chunks):
-
             for attempt in range(2):
                 try:
                     pytrends.build_payload(
