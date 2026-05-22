@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
 """
-Pytrends Flask API v6 — Multi-set manual trigger, global 4h cooldown, always-complete dashboard
+Pytrends Flask API v7 — Individual retry for low-volume games
 Deploy FREE on Render.com  |  n8n Cloud calls this via HTTP Request node.
 
 Architecture:
-  • Dual cache per game-set key:
-      current   — 23h TTL (may have failed countries)
-      last_good — permanent, written only when ALL 6 countries succeed
-  • Merge logic: failed/empty countries → substitute last_good data
-  • GLOBAL cooldown: 4h minimum between ANY fresh Google fetch (shared across all game sets)
-    → Prevents rate-limiting when running 5 different game sets per day
-    → Each set has its own cache key but shares the global fetch timestamp
-  • /cache/status — returns per-set cache state + global cooldown status + recommendation
-  • Country-level source tagging — dashboard shows "↩ prev" for fallback data
+  Phase 1 — Grouped query (up to 5 keywords per call, current behaviour).
+             Results tagged source='group'.
+  Phase 2 — Individual retry for any game/country pair that returned empty.
+             Queries ONE keyword at a time, so Google normalises against
+             that game alone — recovers low-volume terms suppressed by
+             grouped normalisation. Results tagged source='individual'.
+  Phase 3 — Cache + cooldown recorded AFTER both phases complete.
 
-5-set daily usage (n8n manual trigger, spaced 4h apart):
-  Run Set A at 02:00 ICT → global cooldown starts
-  Run Set B at 06:00 ICT → 4h passed, safe
-  Run Set C at 10:00 ICT → 4h passed, safe
-  Run Set D at 14:00 ICT → 4h passed, safe
-  Run Set E at 18:00 ICT → 4h passed, safe
+  Dual cache per game-set key:
+    current   — 23h TTL (may have individual-recovered data)
+    last_good — permanent, written only when ALL pairs have data
+  Merge logic: failed/empty countries → substitute last_good data
+  GLOBAL cooldown: 4h minimum between ANY fresh Google fetch
 
-  Total Google requests per day: 5 sets × 6 countries = 30 calls spread over 16 hours (~1.9/h)
-  Extremely safe — well within Google Trends rate limit tolerance.
+Country-level source tagging:
+  'group'      — retrieved in grouped query
+  'individual' — recovered via solo retry
+  'fallback'   — substituted from last_good cache
+  'no_data'    — genuinely no Google Trends data
+  'error'      — API error on both attempts
 """
 
 from flask import Flask, request, jsonify
@@ -32,9 +33,9 @@ from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
-CACHE_FILE      = "/tmp/trends_cache_v6.json"
-CACHE_TTL_HOURS = 23     # per-set cache TTL
-COOLDOWN_HOURS  = 4      # global minimum hours between ANY fresh Google fetch
+CACHE_FILE      = "/tmp/trends_cache_v7.json"
+CACHE_TTL_HOURS = 23
+COOLDOWN_HOURS  = 4
 
 SEA_COUNTRIES = [
     ("TH", "TH"),
@@ -97,17 +98,12 @@ def _set_last_good(store, key, payload):
 
 # ── Merge: fill failed countries from last_good ───────────────────────────────
 def _merge_with_fallback(current_data, last_good_entry, games):
-    """
-    For every country where current_data has all-empty values,
-    substitute data from last_good. Tag substituted countries with source='fallback'.
-    Returns merged data dict + list of fallback countries used.
-    """
     if not last_good_entry:
         return current_data, []
 
-    last_good_data  = last_good_entry.get("data", {})
-    merged          = dict(current_data)
-    fallback_used   = []
+    last_good_data = last_good_entry.get("data", {})
+    merged         = dict(current_data)
+    fallback_used  = []
 
     for label in ALL_LABELS:
         country_data = merged.get(label, {})
@@ -127,23 +123,52 @@ def _merge_with_fallback(current_data, last_good_entry, games):
 
 # ── Global cooldown helper ─────────────────────────────────────────────────────
 def _get_cooldown_status(store):
-    """
-    Returns (safe_to_fetch, cooldown_remaining_hours, hours_since_fresh_fetch).
-    Global — shared across ALL game sets. Prevents back-to-back fetches that burn
-    through Google Trends rate limits when running multiple different game sets.
-    """
     last_fresh = store.get("last_fresh_fetch")
     if not last_fresh:
         return True, 0.0, None
-
     last_fresh_dt = datetime.fromisoformat(last_fresh)
     hours_since   = (datetime.now() - last_fresh_dt).total_seconds() / 3600
-
     if hours_since >= COOLDOWN_HOURS:
         return True, 0.0, round(hours_since, 1)
     else:
         remaining = COOLDOWN_HOURS - hours_since
         return False, round(remaining, 1), round(hours_since, 1)
+
+# ── Individual retry for a single game/country pair ───────────────────────────
+def _fetch_individual(pytrends, geo, label, game, timeframe):
+    """
+    Query one game for one country in isolation.
+    Normalization is relative to that game alone (not suppressed by grouped query).
+    Returns a result dict with source='individual', or source='no_data'/'error'.
+    """
+    for attempt in range(2):
+        try:
+            if attempt > 0:
+                time.sleep(random.uniform(10, 15))
+            pytrends.build_payload([game], cat=0, timeframe=timeframe, geo=geo, gprop="")
+            df = pytrends.interest_over_time()
+            if not df.empty and game in df.columns:
+                if "isPartial" in df.columns:
+                    df = df.drop(columns=["isPartial"])
+                return {
+                    "dates":  [str(d.date()) for d in df.index],
+                    "values": df[game].tolist(),
+                    "avg":    round(float(df[game].mean()), 2),
+                    "peak":   int(df[game].max()),
+                    "source": "individual",
+                }
+            else:
+                return {"dates": [], "values": [], "avg": 0, "peak": 0, "source": "no_data"}
+        except Exception as e:
+            msg = str(e)
+            is_rate = "429" in msg or "too many" in msg.lower()
+            if attempt == 0:
+                wait = random.uniform(25, 35) if is_rate else random.uniform(8, 12)
+                print(f"[INDIVIDUAL] {geo}/{game} retry wait={wait:.0f}s err={msg[:60]}")
+                time.sleep(wait)
+            else:
+                return {"dates": [], "values": [], "avg": 0, "peak": 0,
+                        "error": msg[:120], "source": "error"}
 
 # ─────────────────────────────────────────────────────────────────────────────
 @app.route("/health", methods=["GET"])
@@ -160,26 +185,19 @@ def health():
         "hours_since_fresh_fetch":  hours_since,
         "last_fresh_fetch_at":      store.get("last_fresh_fetch"),
         "cooldown_hours":           COOLDOWN_HOURS,
-        "version":                  "v6",
+        "version":                  "v7",
     })
 
 @app.route("/cache/status", methods=["POST"])
 def cache_status():
-    """
-    n8n Safety Gate calls this before deciding whether to fetch fresh or use cache.
-    Returns per-set cache state AND global cooldown status.
-    safe_to_fetch = global cooldown passed (regardless of which game set was last fetched).
-    """
     body      = request.get_json(force=True, silent=True) or {}
     games     = body.get("games", [])
     timeframe = body.get("timeframe", "today 3-m")
-
     if not games:
         return jsonify({"error": "games required"}), 400
 
     key   = _cache_key(games, timeframe)
     store = _load_store()
-
     safe_to_fetch, cooldown_remaining, hours_since_fresh = _get_cooldown_status(store)
     current   = store["current"].get(key)
     last_good = store["last_good"].get(key)
@@ -192,7 +210,6 @@ def cache_status():
         "current_age_hours":         None,
         "current_missing_countries": [],
         "last_good_age_hours":       None,
-        # Global cooldown (shared across ALL game sets)
         "safe_to_fetch":             safe_to_fetch,
         "cooldown_remaining_hours":  cooldown_remaining,
         "hours_since_fresh_fetch":   hours_since_fresh,
@@ -206,10 +223,8 @@ def cache_status():
         saved_at = datetime.fromisoformat(current["saved_at"])
         age_h    = (datetime.now() - saved_at).total_seconds() / 3600
         expired  = datetime.now() >= expires
-
         result["current_expired"]   = expired
         result["current_age_hours"] = round(age_h, 1)
-
         missing = []
         for label in ALL_LABELS:
             country_data = current.get("data", {}).get(label, {})
@@ -220,7 +235,6 @@ def cache_status():
             if not has_values:
                 missing.append(label)
         result["current_missing_countries"] = missing
-
         if not expired and not missing:
             result["recommendation"] = "use_cache"
         elif not expired and missing and last_good:
@@ -272,18 +286,18 @@ def get_trends():
     if not isinstance(body, dict):
         body = {}
 
-    games     = body.get("games") or body.get("game_list", [])
-    timeframe = body.get("timeframe", "today 3-m")
-    force     = body.get("force_refresh", False)
+    games          = body.get("games") or body.get("game_list", [])
+    timeframe      = body.get("timeframe", "today 3-m")
+    force          = body.get("force_refresh", False)
+    skip_individual = body.get("skip_individual_retry", False)  # opt-out flag
 
-    print(f"[REQUEST] games={games} timeframe={timeframe} force={force}")
+    print(f"[REQUEST] games={games} timeframe={timeframe} force={force} skip_individual={skip_individual}")
 
     if not games:
         return jsonify({"status": "error", "message": "games array required"}), 400
 
     key   = _cache_key(games, timeframe)
     store = _load_store()
-
     safe_to_fetch, cooldown_remaining, hours_since_fresh = _get_cooldown_status(store)
 
     # ── Cache check ───────────────────────────────────────────────────────────
@@ -304,9 +318,9 @@ def get_trends():
                 "cooldown_remaining_hours": cooldown_remaining,
             })
 
-    # ── Global cooldown gate (blocks even force_refresh if too soon) ──────────
+    # ── Global cooldown gate ──────────────────────────────────────────────────
     if not safe_to_fetch:
-        print(f"[COOLDOWN] Blocked — {cooldown_remaining}h remaining. Serving best available data.")
+        print(f"[COOLDOWN] Blocked — {cooldown_remaining}h remaining.")
         current = store["current"].get(key)
         last_good_entry = _get_last_good(store, key)
         if current:
@@ -337,7 +351,7 @@ def get_trends():
             "cooldown_remaining_hours": cooldown_remaining,
         }), 429
 
-    # ── Fresh fetch from Google Trends ───────────────────────────────────────
+    # ── Phase 1: Grouped fetch ────────────────────────────────────────────────
     pytrends = TrendReq(
         hl="en-US", tz=420,
         timeout=(15, 35),
@@ -359,7 +373,7 @@ def get_trends():
             for attempt in range(2):
                 try:
                     if attempt == 0 and (country_idx > 0 or chunk_idx > 0):
-                        time.sleep(random.uniform(1, 3))   # pre-request jitter
+                        time.sleep(random.uniform(1, 3))
 
                     pytrends.build_payload(
                         chunk, cat=0, timeframe=timeframe, geo=geo, gprop=""
@@ -371,12 +385,13 @@ def get_trends():
                             df = df.drop(columns=["isPartial"])
                         for g in chunk:
                             if g in df.columns:
+                                values = df[g].tolist()
                                 results[label][g] = {
                                     "dates":  [str(d.date()) for d in df.index],
-                                    "values": df[g].tolist(),
+                                    "values": values,
                                     "avg":    round(float(df[g].mean()), 2),
                                     "peak":   int(df[g].max()),
-                                    "source": "fresh",
+                                    "source": "group",
                                 }
                             else:
                                 results[label][g] = {
@@ -389,7 +404,7 @@ def get_trends():
                                 "dates": [], "values": [], "avg": 0, "peak": 0,
                                 "source": "empty"
                             }
-                    break  # success
+                    break
 
                 except Exception as e:
                     msg = str(e)
@@ -418,35 +433,87 @@ def get_trends():
             print(f"[DELAY] after {geo}: {delay:.1f}s")
             time.sleep(delay)
 
-    # ── Record global fresh fetch timestamp ──────────────────────────────────
-    store["last_fresh_fetch"] = datetime.now().isoformat()
-    print(f"[COOLDOWN] Fresh fetch complete. Next safe fetch in {COOLDOWN_HOURS}h.")
+    # ── Phase 2: Individual retry for empty game/country pairs ────────────────
+    # Find pairs where grouped query returned no data.
+    # Query each individually — this avoids suppression from grouped normalization.
+    individual_recovered = []
+    individual_failed    = []
 
-    # ── Save current cache (partial results are fine) ─────────────────────────
+    if not skip_individual:
+        empty_pairs = []
+        for geo, label in SEA_COUNTRIES:
+            for g in games:
+                entry = results.get(label, {}).get(g, {})
+                if not entry.get("values"):
+                    empty_pairs.append((geo, label, g))
+
+        if empty_pairs:
+            print(f"[INDIVIDUAL RETRY] {len(empty_pairs)} empty pairs → retrying individually")
+            prev_label = None
+            for i, (geo, label, g) in enumerate(empty_pairs):
+                # Longer delay when switching countries
+                if i > 0:
+                    wait = random.uniform(18, 25) if label != prev_label else random.uniform(10, 15)
+                    print(f"[INDIVIDUAL] waiting {wait:.1f}s before {geo}/{g}")
+                    time.sleep(wait)
+
+                print(f"[INDIVIDUAL] querying {geo}/{g}")
+                result = _fetch_individual(pytrends, geo, label, g, timeframe)
+                results[label][g] = result
+
+                if result.get("values"):
+                    individual_recovered.append(f"{label}/{g}")
+                    print(f"[INDIVIDUAL] {geo}/{g} ✓ recovered {len(result['values'])} pts (source=individual)")
+                else:
+                    individual_failed.append(f"{label}/{g}")
+                    print(f"[INDIVIDUAL] {geo}/{g} → {result.get('source','no_data')}")
+
+                prev_label = label
+
+            print(f"[INDIVIDUAL RETRY] done — recovered={individual_recovered} failed={individual_failed}")
+
+    # ── Record global fresh fetch timestamp (after ALL phases) ───────────────
+    store["last_fresh_fetch"] = datetime.now().isoformat()
+    print(f"[COOLDOWN] Fresh fetch complete (phases 1+2). Next safe fetch in {COOLDOWN_HOURS}h.")
+
+    # ── Compute coverage stats ────────────────────────────────────────────────
+    total_pairs  = len(SEA_COUNTRIES) * len(games)
+    filled_pairs = sum(
+        1 for _, label in SEA_COUNTRIES
+        for g in games
+        if results.get(label, {}).get(g, {}).get("values")
+    )
+    coverage_pct = round(filled_pairs / total_pairs * 100) if total_pairs > 0 else 0
+
+    # ── Save current cache ────────────────────────────────────────────────────
     current_payload = {
-        "status":           "ok",
-        "data":             results,
-        "games":            games,
-        "timeframe":        timeframe,
-        "countries":        ALL_LABELS,
-        "failed_countries": failed_countries,
-        "from_cache":       False,
+        "status":               "ok",
+        "data":                 results,
+        "games":                games,
+        "timeframe":            timeframe,
+        "countries":            ALL_LABELS,
+        "failed_countries":     failed_countries,
+        "individual_recovered": individual_recovered,
+        "individual_failed":    individual_failed,
+        "coverage_pct":         coverage_pct,
+        "from_cache":           False,
     }
     _set_current(store, key, current_payload)
 
-    # ── Update last_good only when ALL countries succeeded ────────────────────
-    if not failed_countries:
+    # ── Update last_good only when all pairs have data ────────────────────────
+    if not failed_countries and not individual_failed:
         all_have_data = all(
-            any(v.get("values") for v in results[label].values() if isinstance(v, dict))
-            for label in ALL_LABELS
+            results.get(label, {}).get(g, {}).get("values")
+            for _, label in SEA_COUNTRIES
+            for g in games
         )
         if all_have_data:
             _set_last_good(store, key, current_payload)
-            print(f"[LAST_GOOD] Updated — all 6 countries have data")
+            print(f"[LAST_GOOD] Updated — all pairs have data (coverage={coverage_pct}%)")
 
     _save_store(store)
 
-    # ── Merge fallback for any failed countries before returning ──────────────
+    # ── Merge fallback for any still-missing countries ────────────────────────
     merged_data, fallback_used = _merge_with_fallback(
         results,
         _get_last_good(store, key),
@@ -455,8 +522,11 @@ def get_trends():
 
     return jsonify({
         **current_payload,
-        "data":          merged_data,
-        "fallback_used": fallback_used,
+        "data":                 merged_data,
+        "fallback_used":        fallback_used,
+        "coverage_pct":         coverage_pct,
+        "individual_recovered": individual_recovered,
+        "individual_failed":    individual_failed,
     })
 
 
