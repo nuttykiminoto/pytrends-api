@@ -37,6 +37,12 @@ CACHE_FILE      = "/tmp/trends_cache_v7.json"
 CACHE_TTL_HOURS = 23
 COOLDOWN_HOURS  = 4
 
+# When a high-volume game is in the same grouped query, it suppresses
+# lower-volume games — their values get normalized down to near-zero.
+# Any game whose grouped-query peak is at or below this threshold is
+# re-queried individually so it gets its own 0–100 normalization.
+SUPPRESSION_THRESHOLD = 20
+
 SEA_COUNTRIES = [
     ("TH", "TH"),
     ("MY", "Malay"),
@@ -443,8 +449,18 @@ def get_trends():
         empty_pairs = []
         for geo, label in SEA_COUNTRIES:
             for g in games:
-                entry = results.get(label, {}).get(g, {})
-                if not entry.get("values"):
+                entry    = results.get(label, {}).get(g, {})
+                vals     = entry.get("values", [])
+                peak_val = entry.get("peak", 0)
+                # Retry if: no data, all-zero, OR grouped peak so low the game is
+                # likely suppressed by a higher-volume co-query game.
+                # Individual query gives this game its own 0-100 normalization.
+                needs_retry = (
+                    not vals
+                    or not any(v > 0 for v in vals)
+                    or peak_val <= SUPPRESSION_THRESHOLD
+                )
+                if needs_retry:
                     empty_pairs.append((geo, label, g))
 
         if empty_pairs:
