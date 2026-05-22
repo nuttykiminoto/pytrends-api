@@ -43,6 +43,15 @@ COOLDOWN_HOURS  = 4
 # re-queried individually so it gets its own 0–100 normalization.
 SUPPRESSION_THRESHOLD = 20
 
+# Safety limits — prevent runaway force-refresh and individual retry floods.
+# force_refresh is dangerous: bypasses cooldown → higher block risk.
+# Max 2 force_refresh calls allowed in any rolling 24-hour window.
+FORCE_REFRESH_MAX_PER_24H = 2
+# Individual retry makes one API call per (game × country) pair.
+# With 4 games × 6 countries = 24 pairs max. Cap at 10 to limit exposure
+# when suppression is widespread and many pairs need individual retry.
+INDIVIDUAL_RETRY_BUDGET = 10
+
 SEA_COUNTRIES = [
     ("TH", "TH"),
     ("MY", "Malay"),
@@ -127,6 +136,25 @@ def _merge_with_fallback(current_data, last_good_entry, games):
 
     return merged, fallback_used
 
+# ── force_refresh rate-limit helpers ──────────────────────────────────────────
+def _get_force_refresh_log(store):
+    """Return list of ISO timestamps of force_refresh calls in the last 24h."""
+    log = store.get("force_refresh_log", [])
+    cutoff = (datetime.now() - timedelta(hours=24)).isoformat()
+    return [ts for ts in log if ts >= cutoff]
+
+def _can_force_refresh(store):
+    """Return (allowed: bool, used: int, remaining: int)."""
+    log   = _get_force_refresh_log(store)
+    used  = len(log)
+    remaining = max(0, FORCE_REFRESH_MAX_PER_24H - used)
+    return remaining > 0, used, remaining
+
+def _record_force_refresh(store):
+    log = _get_force_refresh_log(store)
+    log.append(datetime.now().isoformat())
+    store["force_refresh_log"] = log
+
 # ── Global cooldown helper ─────────────────────────────────────────────────────
 def _get_cooldown_status(store):
     last_fresh = store.get("last_fresh_fetch")
@@ -168,8 +196,13 @@ def _fetch_individual(pytrends, geo, label, game, timeframe):
         except Exception as e:
             msg = str(e)
             is_rate = "429" in msg or "too many" in msg.lower()
+            if is_rate:
+                # Return immediately with rate_limited sentinel — caller stops the loop.
+                print(f"[INDIVIDUAL] {geo}/{game} → 429 rate limit, stopping individual retry")
+                return {"dates": [], "values": [], "avg": 0, "peak": 0,
+                        "error": msg[:120], "source": "rate_limited"}
             if attempt == 0:
-                wait = random.uniform(25, 35) if is_rate else random.uniform(8, 12)
+                wait = random.uniform(8, 12)
                 print(f"[INDIVIDUAL] {geo}/{game} retry wait={wait:.0f}s err={msg[:60]}")
                 time.sleep(wait)
             else:
@@ -264,6 +297,20 @@ def clear_cache():
         pass
     return jsonify({"status": "ok", "message": "cache cleared"})
 
+@app.route("/force_refresh/status", methods=["GET"])
+def force_refresh_status():
+    """How many force_refresh calls remain in the current 24-hour window."""
+    store = _load_store()
+    fr_allowed, fr_used, fr_remaining = _can_force_refresh(store)
+    log = _get_force_refresh_log(store)
+    return jsonify({
+        "force_refresh_allowed":     fr_allowed,
+        "force_refresh_used_24h":    fr_used,
+        "force_refresh_remaining":   fr_remaining,
+        "force_refresh_max_per_24h": FORCE_REFRESH_MAX_PER_24H,
+        "force_refresh_log":         log,
+    })
+
 # ─────────────────────────────────────────────────────────────────────────────
 @app.route("/trends", methods=["POST"])
 def get_trends():
@@ -292,9 +339,9 @@ def get_trends():
     if not isinstance(body, dict):
         body = {}
 
-    games          = body.get("games") or body.get("game_list", [])
-    timeframe      = body.get("timeframe", "today 3-m")
-    force          = body.get("force_refresh", False)
+    games           = body.get("games") or body.get("game_list", [])
+    timeframe       = body.get("timeframe", "today 3-m")
+    force           = body.get("force_refresh", False)
     skip_individual = body.get("skip_individual_retry", False)  # opt-out flag
 
     print(f"[REQUEST] games={games} timeframe={timeframe} force={force} skip_individual={skip_individual}")
@@ -324,8 +371,49 @@ def get_trends():
                 "cooldown_remaining_hours": cooldown_remaining,
             })
 
+    # ── force_refresh rate-limit gate ────────────────────────────────────────
+    # force=True bypasses cooldown, which is the highest-risk operation.
+    # Max FORCE_REFRESH_MAX_PER_24H uses per rolling 24-hour window.
+    if force:
+        fr_allowed, fr_used, fr_remaining = _can_force_refresh(store)
+        if not fr_allowed:
+            print(f"[FORCE_REFRESH] BLOCKED — used {fr_used}/{FORCE_REFRESH_MAX_PER_24H} in last 24h")
+            # Fall back to best available cache instead of hard error
+            current = _get_current(store, key)
+            if current:
+                merged_data, fallback_used = _merge_with_fallback(
+                    current.get("data", {}), _get_last_good(store, key), games
+                )
+                return jsonify({
+                    **current,
+                    "data":                     merged_data,
+                    "fallback_used":            fallback_used,
+                    "from_cache":               True,
+                    "blocked_reason":           f"force_refresh limit: used {fr_used}/{FORCE_REFRESH_MAX_PER_24H} in 24h",
+                    "safe_to_fetch":            safe_to_fetch,
+                    "cooldown_remaining_hours": cooldown_remaining,
+                })
+            last_good_entry = _get_last_good(store, key)
+            if last_good_entry:
+                return jsonify({
+                    **last_good_entry,
+                    "from_cache":               True,
+                    "fallback_used":            ALL_LABELS,
+                    "blocked_reason":           f"force_refresh limit: used {fr_used}/{FORCE_REFRESH_MAX_PER_24H} in 24h",
+                    "safe_to_fetch":            safe_to_fetch,
+                    "cooldown_remaining_hours": cooldown_remaining,
+                })
+            return jsonify({
+                "status":  "error",
+                "message": f"force_refresh limit reached ({fr_used}/{FORCE_REFRESH_MAX_PER_24H} in 24h). No cache available.",
+            }), 429
+        # Rate limit OK — record this use now so concurrent requests don't double-fire
+        _record_force_refresh(store)
+        _save_store(store)
+        print(f"[FORCE_REFRESH] allowed ({fr_used+1}/{FORCE_REFRESH_MAX_PER_24H} used in 24h)")
+
     # ── Global cooldown gate ──────────────────────────────────────────────────
-    if not safe_to_fetch:
+    if not safe_to_fetch and not force:
         print(f"[COOLDOWN] Blocked — {cooldown_remaining}h remaining.")
         current = store["current"].get(key)
         last_good_entry = _get_last_good(store, key)
@@ -442,8 +530,10 @@ def get_trends():
     # ── Phase 2: Individual retry for empty game/country pairs ────────────────
     # Find pairs where grouped query returned no data.
     # Query each individually — this avoids suppression from grouped normalization.
-    individual_recovered = []
-    individual_failed    = []
+    individual_recovered     = []
+    individual_failed        = []
+    individual_budget_used   = 0
+    individual_rate_limited  = False
 
     if not skip_individual:
         empty_pairs = []
@@ -464,9 +554,19 @@ def get_trends():
                     empty_pairs.append((geo, label, g))
 
         if empty_pairs:
-            print(f"[INDIVIDUAL RETRY] {len(empty_pairs)} empty pairs → retrying individually")
+            budget_used      = 0
+            rate_limited_429  = False
+            capped_pairs     = empty_pairs[:INDIVIDUAL_RETRY_BUDGET]
+            skipped_pairs    = empty_pairs[INDIVIDUAL_RETRY_BUDGET:]
+
+            if skipped_pairs:
+                print(f"[INDIVIDUAL RETRY] budget cap={INDIVIDUAL_RETRY_BUDGET}: "
+                      f"running {len(capped_pairs)}, skipping {len(skipped_pairs)}")
+            else:
+                print(f"[INDIVIDUAL RETRY] {len(capped_pairs)} pairs → retrying individually")
+
             prev_label = None
-            for i, (geo, label, g) in enumerate(empty_pairs):
+            for i, (geo, label, g) in enumerate(capped_pairs):
                 # Longer delay when switching countries
                 if i > 0:
                     wait = random.uniform(18, 25) if label != prev_label else random.uniform(10, 15)
@@ -476,8 +576,15 @@ def get_trends():
                 print(f"[INDIVIDUAL] querying {geo}/{g}")
                 result = _fetch_individual(pytrends, geo, label, g, timeframe)
                 results[label][g] = result
+                budget_used += 1
 
-                if result.get("values"):
+                if result.get("source") == "rate_limited":
+                    # 429 from Google — stop immediately, do not retry any more pairs
+                    rate_limited_429 = True
+                    individual_failed.append(f"{label}/{g}")
+                    print(f"[INDIVIDUAL RETRY] 429 received — stopping (used {budget_used} of {INDIVIDUAL_RETRY_BUDGET} budget)")
+                    break
+                elif result.get("values"):
                     individual_recovered.append(f"{label}/{g}")
                     print(f"[INDIVIDUAL] {geo}/{g} ✓ recovered {len(result['values'])} pts (source=individual)")
                 else:
@@ -486,7 +593,11 @@ def get_trends():
 
                 prev_label = label
 
-            print(f"[INDIVIDUAL RETRY] done — recovered={individual_recovered} failed={individual_failed}")
+            individual_budget_used  = budget_used
+            individual_rate_limited = rate_limited_429
+            print(f"[INDIVIDUAL RETRY] done — recovered={individual_recovered} "
+                  f"failed={individual_failed} budget_used={budget_used} "
+                  f"rate_limited={rate_limited_429}")
 
     # ── Record global fresh fetch timestamp (after ALL phases) ───────────────
     store["last_fresh_fetch"] = datetime.now().isoformat()
@@ -503,16 +614,19 @@ def get_trends():
 
     # ── Save current cache ────────────────────────────────────────────────────
     current_payload = {
-        "status":               "ok",
-        "data":                 results,
-        "games":                games,
-        "timeframe":            timeframe,
-        "countries":            ALL_LABELS,
-        "failed_countries":     failed_countries,
-        "individual_recovered": individual_recovered,
-        "individual_failed":    individual_failed,
-        "coverage_pct":         coverage_pct,
-        "from_cache":           False,
+        "status":                      "ok",
+        "data":                        results,
+        "games":                       games,
+        "timeframe":                   timeframe,
+        "countries":                   ALL_LABELS,
+        "failed_countries":            failed_countries,
+        "individual_recovered":        individual_recovered,
+        "individual_failed":           individual_failed,
+        "individual_budget_used":      individual_budget_used,
+        "individual_budget_cap":       INDIVIDUAL_RETRY_BUDGET,
+        "individual_rate_limited":     individual_rate_limited,
+        "coverage_pct":                coverage_pct,
+        "from_cache":                  False,
     }
     _set_current(store, key, current_payload)
 
