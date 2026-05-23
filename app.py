@@ -50,7 +50,7 @@ FORCE_REFRESH_MAX_PER_24H = 2
 # Individual retry makes one API call per (game × country) pair.
 # With 4 games × 6 countries = 24 pairs max. Cap at 10 to limit exposure
 # when suppression is widespread and many pairs need individual retry.
-INDIVIDUAL_RETRY_BUDGET = 10
+INDIVIDUAL_RETRY_BUDGET = 30   # raised from 10 — covers up to 6 countries × 5 games
 
 SEA_COUNTRIES = [
     ("TH", "TH"),
